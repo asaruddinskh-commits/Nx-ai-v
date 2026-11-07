@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.ViewGroup
 import android.webkit.PermissionRequest
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -147,6 +148,18 @@ fun ArushiWebViewContainer(activity: MainActivity) {
                         error: WebResourceError?
                     ) {
                         super.onReceivedError(view, request, error)
+                    }
+
+                    override fun onRenderProcessGone(
+                        view: WebView?,
+                        detail: RenderProcessGoneDetail?
+                    ): Boolean {
+                        // Prevent host app from crashing when isolated renderer process terminates
+                        view?.let {
+                            (it.parent as? ViewGroup)?.removeView(it)
+                            it.destroy()
+                        }
+                        return true
                     }
                 }
 
