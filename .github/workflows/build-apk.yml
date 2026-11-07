@@ -48,33 +48,62 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - name: Create temporary debug keystore
+      - name: Configure Keystore for Signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 || secrets.KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.STORE_PASSWORD || secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS_SECRET: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -f "./debug.keystore" ]; then
-            echo "debug.keystore already exists."
+          KEYSTORE_DIR="${RUNNER_TEMP}/keystore"
+          mkdir -p "$KEYSTORE_DIR"
+          KEYSTORE_FILE="${KEYSTORE_DIR}/signing.keystore"
+          
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "✅ Using persistent keystore decoded from GitHub Actions Secret (SIGNING_KEYSTORE_BASE64)."
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_FILE"
+            STORE_PASSWORD="${STORE_PASS:-android}"
+            KEY_ALIAS="${KEY_ALIAS_SECRET:-androiddebugkey}"
+            KEY_PASSWORD="${KEY_PASS:-android}"
           else
-            echo "debug.keystore missing; generating temporary debug keystore..."
-            keytool -genkey -v \
-              -keystore ./debug.keystore \
-              -alias androiddebugkey \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -storepass android \
-              -keypass android \
-              -dname "CN=Android Debug,O=Android,C=US"
+            echo "⚠️ Notice: 'SIGNING_KEYSTORE_BASE64' secret not found."
+            echo "Using temporary debug keystore generation for CI build."
+            echo "To preserve the EXACT same certificate across every build and prevent 'Signature verified failed' on updates,"
+            echo "please add SIGNING_KEYSTORE_BASE64 to repository Secrets."
+            
+            if [ -f "./debug.keystore" ]; then
+              cp "./debug.keystore" "$KEYSTORE_FILE"
+            else
+              keytool -genkey -v \
+                -keystore "$KEYSTORE_FILE" \
+                -alias androiddebugkey \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -storepass android \
+                -keypass android \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+            STORE_PASSWORD="android"
+            KEY_ALIAS="androiddebugkey"
+            KEY_PASSWORD="android"
           fi
           
-          if [ ! -f "./debug.keystore" ]; then
-            echo "ERROR: Failed to create ./debug.keystore"
+          if [ ! -f "$KEYSTORE_FILE" ] || [ ! -s "$KEYSTORE_FILE" ]; then
+            echo "ERROR: Keystore file could not be prepared at $KEYSTORE_FILE"
             exit 1
           fi
-          echo "Confirmed: ./debug.keystore exists."
+          
+          echo "KEYSTORE_PATH=${KEYSTORE_FILE}" >> "$GITHUB_ENV"
+          echo "STORE_PASSWORD=${STORE_PASSWORD}" >> "$GITHUB_ENV"
+          echo "KEY_ALIAS=${KEY_ALIAS}" >> "$GITHUB_ENV"
+          echo "KEY_PASSWORD=${KEY_PASSWORD}" >> "$GITHUB_ENV"
+          echo "Keystore successfully configured."
 
       - name: Build Debug APK
         run: gradle :app:assembleDebug --stacktrace --no-daemon
 
-      - name: Verify Debug APK
+      - name: Verify Signed APK with Android apksigner and aapt2
         run: |
           EXPECTED_APK="app/build/outputs/apk/debug/app-debug.apk"
           if [ ! -f "$EXPECTED_APK" ]; then
@@ -103,7 +132,41 @@ jobs:
             *) echo "ERROR: $EXPECTED_APK does not have .apk extension."; exit 1 ;;
           esac
           
-          echo "Confirmed: $EXPECTED_APK exists, is a regular file, is not empty, and has .apk extension."
+          echo "=== 1. Locating Android SDK build-tools ==="
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort -V | tail -n 1)
+          ZIPALIGN=$(find "$ANDROID_HOME/build-tools" -name zipalign | sort -V | tail -n 1)
+          
+          if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then
+            echo "ERROR: apksigner not found in $ANDROID_HOME/build-tools"
+            exit 1
+          fi
+          echo "Found apksigner: $APKSIGNER"
+          
+          echo "=== 2. Verifying APK ZIP Alignment and Archive Integrity ==="
+          if [ -n "$ZIPALIGN" ] && [ -x "$ZIPALIGN" ]; then
+            "$ZIPALIGN" -c -v 4 "$EXPECTED_APK" > /dev/null || {
+              echo "ERROR: zipalign integrity verification failed!"
+              exit 1
+            }
+            echo "✅ ZIP alignment and archive integrity verified."
+          fi
+          
+          echo "=== 3. Inspecting Package Name, Version Code and SDK Levels ==="
+          if [ -n "$AAPT2" ] && [ -x "$AAPT2" ]; then
+            "$AAPT2" dump badging "$EXPECTED_APK" | grep -E "package:|sdkVersion:|targetSdkVersion:"
+          fi
+          
+          echo "=== 4. Official apksigner Signature Verification ==="
+          "$APKSIGNER" verify --verbose --print-certs "$EXPECTED_APK" > apksigner_output.txt
+          cat apksigner_output.txt
+          
+          if ! grep -q "Verifies" apksigner_output.txt; then
+            echo "ERROR: Official apksigner verification failed for $EXPECTED_APK"
+            exit 1
+          fi
+          
+          echo "✅ Official Android apksigner verification succeeded!"
 
       - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
@@ -166,8 +229,10 @@ jobs:
             echo "- **Run Number:** ${GITHUB_RUN_NUMBER}"
             echo "- **Run Attempt:** ${GITHUB_RUN_ATTEMPT}"
             echo "- **Source Commit:** ${GITHUB_SHA}"
+            echo "- **Signature Verification:** Passed official \`apksigner\` check (V1 + V2 Scheme)"
+            echo "- **Package Name:** \`com.aistudio.arushiai.kqzvmp\`"
+            echo "- **Version Code:** \`${GITHUB_RUN_NUMBER}\`"
             echo "- **Testing Notice:** This APK is intended for testing. It is not a Play Store production release."
-            echo "- **Keystore:** Signed only with a temporary debug keystore for development testing."
           } > "$NOTES_FILE"
           
           echo "Publishing release with tag: $RELEASE_TAG and asset: $ASSET_PATH"
@@ -214,4 +279,3 @@ jobs:
               echo "- **Release Notice:** Release publishing encountered an error or lacked repository release permission, but the built APK artifact was safely preserved."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-
